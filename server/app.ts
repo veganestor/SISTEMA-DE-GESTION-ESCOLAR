@@ -23,8 +23,9 @@ import {
 } from './auth';
 import { runInTransaction } from './db';
 import {
-  validateAdminPasscodeIfConfigured,
-  validateSessionSecretIfConfigured,
+  readValidatedAdminPasscodeSafe,
+  readValidatedSessionSecretSafe,
+  validateAdminPasscodeStrength,
   verifyAdminPasscodeConstantTime,
 } from './envConfig';
 import {
@@ -45,6 +46,56 @@ function isValidRole(role: string): role is UserRole {
 
 function isValidShift(shift: string): shift is ShiftType {
   return shift === 'manana' || shift === 'tarde' || shift === 'vespertino';
+}
+
+const ADMIN_PASSCODE_SETTING_KEY = 'admin_passcode_hash';
+
+function loadStoredAdminPasscodeHash(db: DatabaseSync): string | null {
+  try {
+    const row = db
+      .prepare(`SELECT value_json FROM school_calendar_settings WHERE key = ?`)
+      .get(ADMIN_PASSCODE_SETTING_KEY) as { value_json: string } | undefined;
+    if (!row?.value_json) return null;
+    const parsed = JSON.parse(row.value_json) as { hash?: string };
+    return typeof parsed?.hash === 'string' && parsed.hash.includes(':') ? parsed.hash : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredAdminPasscodeHash(db: DatabaseSync, hash: string, nowIso: string): void {
+  db.prepare(
+    `INSERT INTO school_calendar_settings (key, value_json, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+  ).run(ADMIN_PASSCODE_SETTING_KEY, JSON.stringify({ hash, configuredAt: nowIso }), nowIso);
+}
+
+function getAdminPasscodeStatus(db: DatabaseSync): {
+  configured: boolean;
+  source: 'env' | 'initial_setup' | 'none';
+} {
+  const envStatus = readValidatedAdminPasscodeSafe();
+  if (envStatus.configured) {
+    return { configured: true, source: 'env' };
+  }
+  if (loadStoredAdminPasscodeHash(db)) {
+    return { configured: true, source: 'initial_setup' };
+  }
+  return { configured: false, source: 'none' };
+}
+
+function verifyServerAdminPasscode(db: DatabaseSync, candidatePasscode: string): boolean {
+  const envStatus = readValidatedAdminPasscodeSafe();
+  if (envStatus.configured) {
+    // Environment variable always overrides any claimed fallback hash
+    return verifyAdminPasscodeConstantTime(candidatePasscode);
+  }
+  const storedHash = loadStoredAdminPasscodeHash(db);
+  if (!storedHash) return false;
+  const candidate = String(candidatePasscode || '').trim();
+  if (!candidate) return false;
+  return verifyPassword(candidate, storedHash);
 }
 
 function guardianOwnsStudent(
@@ -186,8 +237,14 @@ export function createAttendanceApp(db: DatabaseSync): Express {
       dbConnected = false;
     }
 
-    const sessionStatus = validateSessionSecretIfConfigured();
-    const adminPassStatus = validateAdminPasscodeIfConfigured();
+    const sessionStatus = readValidatedSessionSecretSafe();
+    const envAdminFallback = readValidatedAdminPasscodeSafe();
+    const adminPassStatus = dbConnected
+      ? getAdminPasscodeStatus(db)
+      : {
+          configured: envAdminFallback.configured,
+          source: envAdminFallback.configured ? ('env' as const) : ('none' as const),
+        };
 
     res.status(dbConnected ? 200 : 503).json({
       ok: dbConnected,
@@ -196,27 +253,33 @@ export function createAttendanceApp(db: DatabaseSync): Express {
       configStatus: {
         sessionMode: sessionStatus.configured ? 'env' : 'ephemeral',
         adminPasscodeConfigured: adminPassStatus.configured,
+        adminPasscodeSource: adminPassStatus.source,
       },
     });
   });
 
   app.get('/api/auth/status', (_req, res) => {
-    const adminPassStatus = validateAdminPasscodeIfConfigured();
+    const envPassStatus = readValidatedAdminPasscodeSafe();
+    const effectivePassStatus = getAdminPasscodeStatus(db);
     res.json({
       ok: true,
       hasAdmin: hasAnyAdminUser(db),
-      requiresBootstrapPasscode: adminPassStatus.configured,
+      requiresBootstrapPasscode: envPassStatus.configured,
+      adminPasscodeConfigured: effectivePassStatus.configured,
+      adminPasscodeSource: effectivePassStatus.source,
     });
   });
 
   app.post('/api/auth/bootstrap-admin', (req, res) => {
-    const { username, password, fullName, email, bootstrapPasscode } = (req.body || {}) as {
-      username?: string;
-      password?: string;
-      fullName?: string;
-      email?: string;
-      bootstrapPasscode?: string;
-    };
+    const { username, password, fullName, email, bootstrapPasscode, initialAdminPasscode } =
+      (req.body || {}) as {
+        username?: string;
+        password?: string;
+        fullName?: string;
+        email?: string;
+        bootstrapPasscode?: string;
+        initialAdminPasscode?: string;
+      };
 
     if (hasAnyAdminUser(db)) {
       res.status(409).json({
@@ -226,7 +289,7 @@ export function createAttendanceApp(db: DatabaseSync): Express {
       return;
     }
 
-    const adminPassStatus = validateAdminPasscodeIfConfigured();
+    const adminPassStatus = readValidatedAdminPasscodeSafe();
     if (adminPassStatus.configured) {
       if (!verifyAdminPasscodeConstantTime(String(bootstrapPasscode || ''))) {
         res.status(403).json({
@@ -234,6 +297,26 @@ export function createAttendanceApp(db: DatabaseSync): Express {
           error: 'Código de activación inicial incorrecto.',
         });
         return;
+      }
+    }
+
+    let initialPasscodeHash: string | null = null;
+    if (!adminPassStatus.configured && initialAdminPasscode !== undefined) {
+      const trimmedInitial = String(initialAdminPasscode).trim();
+      if (trimmedInitial.length > 0) {
+        try {
+          const validatedCode = validateAdminPasscodeStrength(trimmedInitial);
+          initialPasscodeHash = hashPassword(validatedCode);
+        } catch (err) {
+          res.status(400).json({
+            ok: false,
+            error:
+              err instanceof Error
+                ? err.message
+                : 'El código privado de administrador debe tener al menos 8 caracteres seguros y no ser predecible.',
+          });
+          return;
+        }
       }
     }
 
@@ -265,13 +348,20 @@ export function createAttendanceApp(db: DatabaseSync): Express {
            VALUES (?, ?, ?, ?, 'admin', ?, NULL, 1, ?, ?)`
         ).run(userId, cleanUsername, cleanEmail, cleanFullName, passwordHash, nowIso, nowIso);
 
+        if (initialPasscodeHash) {
+          saveStoredAdminPasscodeHash(db, initialPasscodeHash, nowIso);
+        }
+
         recordAuditLog(
           db,
           { id: userId, fullName: cleanFullName, role: 'admin' },
           'ADMIN_BOOTSTRAP',
           'app_user',
           userId,
-          { username: cleanUsername }
+          {
+            username: cleanUsername,
+            adminPasscodeConfiguredOnBootstrap: Boolean(initialPasscodeHash),
+          }
         );
       });
     } catch (err) {
@@ -351,7 +441,7 @@ export function createAttendanceApp(db: DatabaseSync): Express {
   });
 
   app.post('/api/auth/admin-passcode-reset', (req, res) => {
-    const adminPassStatus = validateAdminPasscodeIfConfigured();
+    const adminPassStatus = getAdminPasscodeStatus(db);
     if (!adminPassStatus.configured) {
       res.status(403).json({
         ok: false,
@@ -366,7 +456,7 @@ export function createAttendanceApp(db: DatabaseSync): Express {
       newPassword?: string;
     };
 
-    if (!verifyAdminPasscodeConstantTime(String(bootstrapPasscode || ''))) {
+    if (!verifyServerAdminPasscode(db, String(bootstrapPasscode || ''))) {
       res.status(403).json({
         ok: false,
         error: 'Código administrativo del servidor incorrecto.',
@@ -426,7 +516,7 @@ export function createAttendanceApp(db: DatabaseSync): Express {
         'ADMIN_PASSCODE_OVERRIDE',
         'app_user',
         adminRow.id,
-        { username: adminRow.username }
+        { username: adminRow.username, source: adminPassStatus.source }
       );
     });
 
@@ -444,6 +534,71 @@ export function createAttendanceApp(db: DatabaseSync): Express {
       },
     });
   });
+
+  app.post(
+    '/api/auth/admin-passcode',
+    requireAuth,
+    requireRoles(['admin']),
+    (req: AuthenticatedRequest, res) => {
+      if (readValidatedAdminPasscodeSafe().configured) {
+        res.status(409).json({
+          ok: false,
+          error:
+            'El código administrativo está gestionado por variable de entorno del servidor (ATTENDANCE_ADMIN_PASSCODE) y prevalece sobre la configuración local.',
+        });
+        return;
+      }
+
+      const { currentPassword, newAdminPasscode } = (req.body || {}) as {
+        currentPassword?: string;
+        newAdminPasscode?: string;
+      };
+
+      const actor = req.authUser!;
+      const adminRow = db
+        .prepare(`SELECT password_hash FROM app_users WHERE id = ? AND is_active = 1`)
+        .get(actor.id) as { password_hash: string } | undefined;
+
+      if (!adminRow || !verifyPassword(String(currentPassword || ''), adminRow.password_hash)) {
+        res.status(403).json({
+          ok: false,
+          error: 'La contraseña actual del administrador es incorrecta.',
+        });
+        return;
+      }
+
+      let validatedCode: string;
+      try {
+        validatedCode = validateAdminPasscodeStrength(String(newAdminPasscode || ''));
+      } catch (err) {
+        res.status(400).json({
+          ok: false,
+          error:
+            err instanceof Error
+              ? err.message
+              : 'El código privado de administrador debe tener al menos 8 caracteres seguros y no ser predecible.',
+        });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const hashedCode = hashPassword(validatedCode);
+
+      runInTransaction(db, () => {
+        saveStoredAdminPasscodeHash(db, hashedCode, nowIso);
+        recordAuditLog(
+          db,
+          { id: actor.id, fullName: actor.fullName, role: actor.role },
+          'ADMIN_PASSCODE_CONFIGURED',
+          'security_settings',
+          ADMIN_PASSCODE_SETTING_KEY,
+          { source: 'initial_setup' }
+        );
+      });
+
+      res.json({ ok: true, adminPasscodeConfigured: true, adminPasscodeSource: 'initial_setup' });
+    }
+  );
 
   app.post(
     '/api/auth/logout',

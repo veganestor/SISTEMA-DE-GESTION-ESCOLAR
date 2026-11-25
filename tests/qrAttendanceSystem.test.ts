@@ -673,12 +673,18 @@ test('Validación de ATTENDANCE_DB_PATH, SESSION_SECRET y ATTENDANCE_ADMIN_PASSC
     assert.equal(validatedSecret.configured, true);
     assert.equal(validatedSecret.secret, strongSecret);
 
-    // 3. ATTENDANCE_ADMIN_PASSCODE: rejects weak defaults, accepts strong server passcode
+    // 3. ATTENDANCE_ADMIN_PASSCODE: rejects weak defaults/repetitive strings, accepts strong server passcodes
     process.env.ATTENDANCE_ADMIN_PASSCODE = '1234';
     assert.throws(() => validateAdminPasscodeIfConfigured(), /al menos 8 caracteres/i);
 
     process.env.ATTENDANCE_ADMIN_PASSCODE = 'admin123';
     assert.throws(() => validateAdminPasscodeIfConfigured(), /predeterminados/i);
+
+    process.env.ATTENDANCE_ADMIN_PASSCODE = 'aaaaaaaa';
+    assert.throws(() => validateAdminPasscodeIfConfigured(), /predeterminados/i);
+
+    process.env.ATTENDANCE_ADMIN_PASSCODE = 'Esc2026!';
+    assert.equal(validateAdminPasscodeIfConfigured().configured, true);
 
     const strongPasscode = `Adm-${crypto.randomBytes(12).toString('hex')}`;
     process.env.ATTENDANCE_ADMIN_PASSCODE = strongPasscode;
@@ -1042,3 +1048,223 @@ test('Middleware requireAuth y requireRoles protege todas las rutas escolares y 
     await h.close();
   }
 });
+
+test('Configuración inicial del código de administrador sin variable de entorno + precedencia de ATTENDANCE_ADMIN_PASSCODE', async () => {
+  const prevPasscode = process.env.ATTENDANCE_ADMIN_PASSCODE;
+  delete process.env.ATTENDANCE_ADMIN_PASSCODE;
+
+  const h = await startHarness();
+  try {
+    // 1. Sin env var ni admin inicial: requiresBootstrapPasscode=false, adminPasscodeConfigured=false
+    const st0 = await api<{
+      hasAdmin: boolean;
+      requiresBootstrapPasscode: boolean;
+      adminPasscodeConfigured: boolean;
+      adminPasscodeSource: string;
+    }>(h.baseUrl, '/api/auth/status');
+    assert.equal(st0.status, 200);
+    assert.equal(st0.data.hasAdmin, false);
+    assert.equal(st0.data.requiresBootstrapPasscode, false);
+    assert.equal(st0.data.adminPasscodeConfigured, false);
+    assert.equal(st0.data.adminPasscodeSource, 'none');
+
+    // 2. Código inicial débil es rechazado con 400
+    const weakBoot = await api(h.baseUrl, '/api/auth/bootstrap-admin', {
+      method: 'POST',
+      body: {
+        fullName: 'Dirección Escolar',
+        username: 'dir_init',
+        email: 'dir@escuela.edu.ar',
+        password: 'Password123!',
+        initialAdminPasscode: 'admin123',
+      },
+    });
+    assert.equal(weakBoot.status, 400);
+
+    // 3. Alta inicial válida con código privado de administrador almacenado con hash scrypt en servidor
+    const initialCode = 'Bulacios#2026!';
+    const goodBoot = await api<{ ok: boolean; token: string }>(
+      h.baseUrl,
+      '/api/auth/bootstrap-admin',
+      {
+        method: 'POST',
+        body: {
+          fullName: 'Dirección Escolar',
+          username: 'dir_init',
+          email: 'dir@escuela.edu.ar',
+          password: 'Password123!',
+          initialAdminPasscode: initialCode,
+        },
+      }
+    );
+    assert.equal(goodBoot.status, 201);
+    const adminToken = goodBoot.data.token;
+
+    // Verificar que no se guarda en texto plano en SQLite
+    const rawRow = h.db
+      .prepare(`SELECT value_json FROM school_calendar_settings WHERE key = 'admin_passcode_hash'`)
+      .get() as { value_json: string } | undefined;
+    assert.ok(rawRow?.value_json);
+    assert.equal(rawRow!.value_json.includes(initialCode), false);
+
+    // /api/auth/status refleja adminPasscodeConfigured=true (source=initial_setup)
+    const st1 = await api<{
+      hasAdmin: boolean;
+      requiresBootstrapPasscode: boolean;
+      adminPasscodeConfigured: boolean;
+      adminPasscodeSource: string;
+    }>(h.baseUrl, '/api/auth/status');
+    assert.equal(st1.data.hasAdmin, true);
+    assert.equal(st1.data.requiresBootstrapPasscode, false);
+    assert.equal(st1.data.adminPasscodeConfigured, true);
+    assert.equal(st1.data.adminPasscodeSource, 'initial_setup');
+
+    // 4. Recuperación administrativa funciona solo con el código privado configurado
+    const wrongRecovery = await api(h.baseUrl, '/api/auth/admin-passcode-reset', {
+      method: 'POST',
+      body: {
+        username: 'dir_init',
+        newPassword: 'NewPassword456!',
+        bootstrapPasscode: 'ClaveIncorrecta99',
+      },
+    });
+    assert.equal(wrongRecovery.status, 403);
+
+    const goodRecovery = await api<{ ok: boolean; token: string }>(
+      h.baseUrl,
+      '/api/auth/admin-passcode-reset',
+      {
+        method: 'POST',
+        body: {
+          username: 'dir_init',
+          newPassword: 'NewPassword456!',
+          bootstrapPasscode: initialCode,
+        },
+      }
+    );
+    assert.equal(goodRecovery.status, 200);
+
+    // 5. Rotación protegida en POST /api/auth/admin-passcode (solo admin + contraseña actual válida)
+    assert.equal(
+      (await api(h.baseUrl, '/api/auth/admin-passcode', { method: 'POST', body: {} })).status,
+      401
+    );
+    const wrongCurrent = await api(h.baseUrl, '/api/auth/admin-passcode', {
+      method: 'POST',
+      token: adminToken,
+      body: { currentPassword: 'WrongPassword!', newAdminPasscode: 'NuevoCod#2026!' },
+    });
+    assert.equal(wrongCurrent.status, 403);
+
+    const rotated = await api(h.baseUrl, '/api/auth/admin-passcode', {
+      method: 'POST',
+      token: adminToken,
+      body: { currentPassword: 'NewPassword456!', newAdminPasscode: 'NuevoCod#2026!' },
+    });
+    assert.equal(rotated.status, 200);
+
+    // 6. Si ATTENDANCE_ADMIN_PASSCODE se define en el entorno, SIEMPRE prevalece sobre el hash local
+    const envOverrideCode = `EnvOverride-${crypto.randomBytes(8).toString('hex')}`;
+    process.env.ATTENDANCE_ADMIN_PASSCODE = envOverrideCode;
+
+    const stEnv = await api<{ adminPasscodeSource: string }>(h.baseUrl, '/api/auth/status');
+    assert.equal(stEnv.data.adminPasscodeSource, 'env');
+
+    const localBlockedByEnv = await api(h.baseUrl, '/api/auth/admin-passcode-reset', {
+      method: 'POST',
+      body: {
+        username: 'dir_init',
+        newPassword: 'AnotherPassword789!',
+        bootstrapPasscode: 'NuevoCod#2026!',
+      },
+    });
+    assert.equal(localBlockedByEnv.status, 403);
+
+    const envAccepted = await api(h.baseUrl, '/api/auth/admin-passcode-reset', {
+      method: 'POST',
+      body: {
+        username: 'dir_init',
+        newPassword: 'AnotherPassword789!',
+        bootstrapPasscode: envOverrideCode,
+      },
+    });
+    assert.equal(envAccepted.status, 200);
+
+    const rotateBlockedByEnv = await api(h.baseUrl, '/api/auth/admin-passcode', {
+      method: 'POST',
+      token: adminToken,
+      body: { currentPassword: 'AnotherPassword789!', newAdminPasscode: 'OtroCod#2026!' },
+    });
+    assert.equal(rotateBlockedByEnv.status, 409);
+  } finally {
+    if (prevPasscode === undefined) delete process.env.ATTENDANCE_ADMIN_PASSCODE;
+    else process.env.ATTENDANCE_ADMIN_PASSCODE = prevPasscode;
+    await h.close();
+  }
+});
+
+test('Manejo robusto en server/envConfig: .env ausente/inválido y fallback seguro ante variables faltantes o malformadas', () => {
+  const prevDbPath = process.env.ATTENDANCE_DB_PATH;
+  const prevSecret = process.env.SESSION_SECRET;
+  const prevPasscode = process.env.ATTENDANCE_ADMIN_PASSCODE;
+  const prevCustom = process.env.TEST_BOM_KEY;
+
+  try {
+    // 1. Directorio inexistente o .env que es un directorio no detienen la carga
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sge-dotenv-resilience-'));
+    try {
+      assert.equal(loadProjectDotEnv(path.join(tmpDir, 'missing-dir')), false);
+
+      fs.mkdirSync(path.join(tmpDir, '.env'));
+      assert.equal(loadProjectDotEnv(tmpDir), false);
+      fs.rmdirSync(path.join(tmpDir, '.env'));
+
+      // 2. .env con UTF-8 BOM, prefijo export y comentarios en línea
+      delete process.env.TEST_BOM_KEY;
+      fs.writeFileSync(
+        path.join(tmpDir, '.env'),
+        `\uFEFFexport TEST_BOM_KEY=valor_ok # comentario\n`,
+        'utf8'
+      );
+      assert.equal(loadProjectDotEnv(tmpDir), true);
+      assert.equal(process.env.TEST_BOM_KEY, 'valor_ok');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+
+    // 3. Variables opcionales ausentes: arranque limpio sin errores ni advertencias
+    delete process.env.ATTENDANCE_DB_PATH;
+    delete process.env.SESSION_SECRET;
+    delete process.env.ATTENDANCE_ADMIN_PASSCODE;
+    const cleanStartup = validateStartupEnvironment();
+    assert.equal(cleanStartup.dbPath, path.resolve(PROJECT_ROOT, 'data', 'attendance.db'));
+    assert.equal(cleanStartup.sessionSecretMode, 'ephemeral');
+    assert.equal(cleanStartup.adminPasscodeConfigured, false);
+    assert.equal(cleanStartup.warnings.length, 0);
+
+    // 4. Variables opcionales con valores inválidos/débiles/temporales: rechaza (fail-closed) y no detiene el servidor
+    process.env.ATTENDANCE_DB_PATH = path.join(os.tmpdir(), 'temp-disallowed.db');
+    process.env.SESSION_SECRET = 'short-weak';
+    process.env.ATTENDANCE_ADMIN_PASSCODE = '123';
+    const recoveredStartup = validateStartupEnvironment();
+    assert.equal(recoveredStartup.dbPath, path.resolve(PROJECT_ROOT, 'data', 'attendance.db'));
+    assert.equal(recoveredStartup.dbFromEnv, false);
+    assert.equal(recoveredStartup.sessionSecretMode, 'ephemeral');
+    assert.equal(recoveredStartup.adminPasscodeConfigured, false);
+    assert.equal(recoveredStartup.warnings.length, 3);
+    assert.equal(process.env.ATTENDANCE_DB_PATH, undefined);
+    assert.equal(process.env.SESSION_SECRET, undefined);
+    assert.equal(process.env.ATTENDANCE_ADMIN_PASSCODE, undefined);
+  } finally {
+    if (prevDbPath === undefined) delete process.env.ATTENDANCE_DB_PATH;
+    else process.env.ATTENDANCE_DB_PATH = prevDbPath;
+    if (prevSecret === undefined) delete process.env.SESSION_SECRET;
+    else process.env.SESSION_SECRET = prevSecret;
+    if (prevPasscode === undefined) delete process.env.ATTENDANCE_ADMIN_PASSCODE;
+    else process.env.ATTENDANCE_ADMIN_PASSCODE = prevPasscode;
+    if (prevCustom === undefined) delete process.env.TEST_BOM_KEY;
+    else process.env.TEST_BOM_KEY = prevCustom;
+  }
+});
+
+

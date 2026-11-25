@@ -32,12 +32,14 @@ export const BackendAuthGate: React.FC<BackendAuthGateProps> = ({
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [hasAdmin, setHasAdmin] = useState(true);
   const [requiresPasscode, setRequiresPasscode] = useState(false);
+  const [adminPasscodeConfigured, setAdminPasscodeConfigured] = useState(false);
 
   const [fullName, setFullName] = useState('');
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [bootstrapPasscode, setBootstrapPasscode] = useState('');
+  const [initialAdminPasscode, setInitialAdminPasscode] = useState('');
   const [recoveryMode, setRecoveryMode] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -49,6 +51,9 @@ export const BackendAuthGate: React.FC<BackendAuthGateProps> = ({
         if (!active) return;
         setHasAdmin(res.hasAdmin);
         setRequiresPasscode(res.requiresBootstrapPasscode);
+        setAdminPasscodeConfigured(
+          Boolean(res.adminPasscodeConfigured ?? res.requiresBootstrapPasscode)
+        );
       })
       .catch(() => {
         if (!active) return;
@@ -104,8 +109,14 @@ export const BackendAuthGate: React.FC<BackendAuthGateProps> = ({
         email,
         password,
         bootstrapPasscode: requiresPasscode ? bootstrapPasscode : undefined,
+        initialAdminPasscode: !requiresPasscode ? initialAdminPasscode : undefined,
       });
       setHasAdmin(true);
+      if (requiresPasscode || initialAdminPasscode.trim().length >= 8) {
+        setAdminPasscodeConfigured(true);
+      }
+      setInitialAdminPasscode('');
+      setBootstrapPasscode('');
       onAuthenticated(user);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Error configurando el administrador.');
@@ -231,7 +242,7 @@ export const BackendAuthGate: React.FC<BackendAuthGateProps> = ({
               className="w-full px-3.5 py-2.5 rounded-xl bg-white border border-sky-200 text-sm font-semibold outline-none focus:border-sky-500"
             />
           </div>
-          {requiresPasscode && (
+          {requiresPasscode ? (
             <div>
               <label className="block text-xs font-extrabold text-slate-700 mb-1">
                 Código de Activación del Servidor
@@ -244,6 +255,24 @@ export const BackendAuthGate: React.FC<BackendAuthGateProps> = ({
                 placeholder="Código institucional provisto por el servidor"
                 className="w-full px-3.5 py-2.5 rounded-xl bg-white border border-sky-200 text-sm font-semibold outline-none focus:border-sky-500"
               />
+            </div>
+          ) : (
+            <div>
+              <label className="block text-xs font-extrabold text-slate-700 mb-1">
+                Código Privado de Administrador (mínimo 8 caracteres)
+              </label>
+              <input
+                type="password"
+                required
+                minLength={8}
+                value={initialAdminPasscode}
+                onChange={(e) => setInitialAdminPasscode(e.target.value)}
+                placeholder="Defina una clave privada para recuperación administrativa"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-white border border-sky-200 text-sm font-semibold outline-none focus:border-sky-500"
+              />
+              <p className="text-[11px] text-slate-500 mt-1">
+                Se almacena cifrado únicamente en el servidor para recuperación segura del acceso administrativo.
+              </p>
             </div>
           )}
           <button
@@ -282,17 +311,17 @@ export const BackendAuthGate: React.FC<BackendAuthGateProps> = ({
               className="w-full px-3.5 py-2.5 rounded-xl bg-white border border-sky-200 text-sm font-semibold outline-none focus:border-sky-500"
             />
           </div>
-          {recoveryMode && requiresPasscode && (
+          {recoveryMode && adminPasscodeConfigured && (
             <div>
               <label className="block text-xs font-extrabold text-slate-700 mb-1">
-                Código Administrativo del Servidor
+                Código Privado de Administrador
               </label>
               <input
                 type="password"
                 required
                 value={bootstrapPasscode}
                 onChange={(e) => setBootstrapPasscode(e.target.value)}
-                placeholder="Código institucional provisto por el servidor"
+                placeholder="Ingrese el código privado de administrador"
                 className="w-full px-3.5 py-2.5 rounded-xl bg-white border border-sky-200 text-sm font-semibold outline-none focus:border-sky-500"
               />
             </div>
@@ -311,7 +340,7 @@ export const BackendAuthGate: React.FC<BackendAuthGateProps> = ({
                 : 'Iniciar Sesión'}
             </span>
           </button>
-          {requiresPasscode && (
+          {adminPasscodeConfigured && (
             <div className="text-center pt-1">
               <button
                 type="button"
@@ -323,7 +352,7 @@ export const BackendAuthGate: React.FC<BackendAuthGateProps> = ({
               >
                 {recoveryMode
                   ? 'Volver al inicio de sesión habitual'
-                  : 'Recuperar acceso de administrador con código del servidor'}
+                  : 'Recuperar acceso de administrador con código privado'}
               </button>
             </div>
           )}

@@ -2,13 +2,13 @@ import crypto from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import type { DatabaseSync } from 'node:sqlite';
 import type { AuthUserSession, UserRole } from '../shared/attendanceDomain';
-import { validateSessionSecretIfConfigured } from './envConfig';
+import { readValidatedSessionSecretSafe } from './envConfig';
 
 const EPHEMERAL_FALLBACK_SECRET = crypto.randomBytes(32).toString('hex');
 const revokedTokenIds = new Map<string, number>();
 
 function getSessionSecret(): string {
-  const envCheck = validateSessionSecretIfConfigured();
+  const envCheck = readValidatedSessionSecretSafe();
   return envCheck.configured && envCheck.secret ? envCheck.secret : EPHEMERAL_FALLBACK_SECRET;
 }
 

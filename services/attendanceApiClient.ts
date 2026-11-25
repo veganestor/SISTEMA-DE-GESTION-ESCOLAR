@@ -68,6 +68,8 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
 export async function fetchAuthStatus(): Promise<{
   hasAdmin: boolean;
   requiresBootstrapPasscode: boolean;
+  adminPasscodeConfigured?: boolean;
+  adminPasscodeSource?: 'env' | 'initial_setup' | 'none';
 }> {
   return apiRequest('/api/auth/status');
 }
@@ -78,6 +80,7 @@ export async function bootstrapInitialAdmin(payload: {
   email: string;
   password: string;
   bootstrapPasscode?: string;
+  initialAdminPasscode?: string;
 }): Promise<AuthUserSession> {
   const data = await apiRequest<{ ok: boolean; token: string; user: AuthUserSession }>(
     '/api/auth/bootstrap-admin',

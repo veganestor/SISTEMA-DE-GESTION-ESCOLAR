@@ -37,6 +37,7 @@ export interface ValidatedEnvConfig {
   sessionSecretMode: 'env' | 'ephemeral';
   adminPasscodeConfigured: boolean;
   envFileLoaded: boolean;
+  warnings: string[];
 }
 
 let dotEnvLoaded = false;
@@ -44,27 +45,60 @@ let dotEnvAttempted = false;
 
 function isPlatformPlaceholderFlag(value: string | undefined): boolean {
   const normalized = (value ?? '').trim().toLowerCase();
-  return normalized === '1' || normalized === '0' || normalized === 'true' || normalized === 'false';
+  return (
+    normalized === '1' ||
+    normalized === '0' ||
+    normalized === 'true' ||
+    normalized === 'false' ||
+    normalized === 'undefined' ||
+    normalized === 'null' ||
+    normalized === 'none'
+  );
 }
 
 /**
  * Loads key=value pairs from <PROJECT_ROOT>/.env if the file exists.
  * Never overrides real non-empty variables injected by the host runtime,
- * except boolean/flag placeholders (e.g. "1") on ATTENDANCE_DB_PATH.
+ * except invalid placeholder flags on ATTENDANCE_DB_PATH.
+ * Safe against missing, unreadable, directory, or malformed .env files.
  */
 export function loadProjectDotEnv(customRoot = PROJECT_ROOT): boolean {
   const envPath = path.resolve(customRoot, '.env');
   if (customRoot === PROJECT_ROOT) {
     dotEnvAttempted = true;
   }
-  if (!fs.existsSync(envPath)) {
+
+  let content: string;
+  try {
+    if (!fs.existsSync(envPath)) {
+      return false;
+    }
+    const stat = fs.statSync(envPath);
+    if (!stat.isFile()) {
+      console.warn(
+        `[Config] Se omitió "${envPath}" porque no es un archivo regular. El servidor continuará con las variables del entorno.`
+      );
+      return false;
+    }
+    content = fs.readFileSync(envPath, 'utf8');
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[Config] No se pudo leer el archivo .env (${envPath}): ${detail}. El servidor continuará con las variables del entorno y valores seguros por defecto.`
+    );
     return false;
   }
 
-  const content = fs.readFileSync(envPath, 'utf8');
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
+  // Strip optional UTF-8 BOM from first line
+  const normalizedContent = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+
+  for (const rawLine of normalizedContent.split(/\r?\n/)) {
+    let line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
+    if (line.startsWith('export ')) {
+      line = line.slice('export '.length).trim();
+    }
+
     const eqIndex = line.indexOf('=');
     if (eqIndex <= 0) continue;
 
@@ -72,11 +106,16 @@ export function loadProjectDotEnv(customRoot = PROJECT_ROOT): boolean {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
 
     let val = line.slice(eqIndex + 1).trim();
-    if (
+    const isQuoted =
       (val.startsWith('"') && val.endsWith('"') && val.length >= 2) ||
-      (val.startsWith("'") && val.endsWith("'") && val.length >= 2)
-    ) {
+      (val.startsWith("'") && val.endsWith("'") && val.length >= 2);
+    if (isQuoted) {
       val = val.slice(1, -1);
+    } else {
+      const inlineCommentIdx = val.search(/\s+#/);
+      if (inlineCommentIdx !== -1) {
+        val = val.slice(0, inlineCommentIdx).trim();
+      }
     }
 
     const existing = process.env[key];
@@ -106,13 +145,13 @@ export function ensureProjectDotEnvLoaded(): boolean {
   return dotEnvLoaded;
 }
 
-function isWeakOrPredictableSecret(value: string): boolean {
+function isWeakOrPredictableSecret(value: string, minUniqueChars = 8): boolean {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return true;
 
   // Reject single-character repetition or very low entropy
   const uniqueChars = new Set(normalized).size;
-  if (uniqueChars < 8) return true;
+  if (uniqueChars < minUniqueChars) return true;
 
   for (const pattern of WEAK_PLACEHOLDER_PATTERNS) {
     if (normalized === pattern || normalized.includes(pattern)) {
@@ -286,6 +325,42 @@ export function validateSessionSecretIfConfigured(): {
 }
 
 /**
+ * Non-throwing fail-closed reader for SESSION_SECRET at request/runtime.
+ * Never accepts a weak or short secret and never crashes an active server.
+ */
+export function readValidatedSessionSecretSafe(): {
+  configured: boolean;
+  secret?: string;
+} {
+  try {
+    return validateSessionSecretIfConfigured();
+  } catch {
+    return { configured: false };
+  }
+}
+
+/**
+ * Validates that a candidate admin passcode meets minimum length and entropy requirements
+ * and does not match weak/default placeholder patterns.
+ */
+export function validateAdminPasscodeStrength(candidate: string): string {
+  const raw = String(candidate || '').trim();
+  if (raw.length < 8) {
+    throw new Error(
+      'Configuración inválida de ATTENDANCE_ADMIN_PASSCODE: si se define, debe tener al menos 8 caracteres seguros.'
+    );
+  }
+
+  if (isWeakOrPredictableSecret(raw, 5)) {
+    throw new Error(
+      'Configuración inválida de ATTENDANCE_ADMIN_PASSCODE: no se permiten códigos predeterminados o predecibles.'
+    );
+  }
+
+  return raw;
+}
+
+/**
  * Validates ATTENDANCE_ADMIN_PASSCODE if configured in process.env.
  * Rejects short (<8 chars) or trivial/default values.
  */
@@ -298,29 +373,34 @@ export function validateAdminPasscodeIfConfigured(): {
     return { configured: false };
   }
 
-  if (raw.length < 8) {
-    throw new Error(
-      'Configuración inválida de ATTENDANCE_ADMIN_PASSCODE: si se define, debe tener al menos 8 caracteres seguros.'
-    );
-  }
-
-  if (isWeakOrPredictableSecret(raw)) {
-    throw new Error(
-      'Configuración inválida de ATTENDANCE_ADMIN_PASSCODE: no se permiten códigos predeterminados o predecibles.'
-    );
-  }
+  const validated = validateAdminPasscodeStrength(raw);
 
   return {
     configured: true,
-    digest: crypto.createHash('sha256').update(raw, 'utf8').digest(),
+    digest: crypto.createHash('sha256').update(validated, 'utf8').digest(),
   };
+}
+
+/**
+ * Non-throwing fail-closed reader for ATTENDANCE_ADMIN_PASSCODE at request/runtime.
+ * Never accepts a weak or short passcode and never crashes an active server.
+ */
+export function readValidatedAdminPasscodeSafe(): {
+  configured: boolean;
+  digest?: Buffer;
+} {
+  try {
+    return validateAdminPasscodeIfConfigured();
+  } catch {
+    return { configured: false };
+  }
 }
 
 /**
  * Constant-time verification of a user-supplied admin passcode against ATTENDANCE_ADMIN_PASSCODE.
  */
 export function verifyAdminPasscodeConstantTime(candidatePasscode: string): boolean {
-  const status = validateAdminPasscodeIfConfigured();
+  const status = readValidatedAdminPasscodeSafe();
   if (!status.configured || !status.digest) return false;
   const candidate = String(candidatePasscode || '').trim();
   if (!candidate) return false;
@@ -329,37 +409,94 @@ export function verifyAdminPasscodeConstantTime(candidatePasscode: string): bool
 }
 
 /**
- * Loads .env if present and validates all critical server environment variables before startup.
+ * Loads .env if present and validates all server environment variables before startup.
+ * Fails safely when optional variables are absent or malformed: weak secrets are rejected
+ * (never used) and replaced with secure runtime fallbacks so the application starts cleanly.
  */
 export function validateStartupEnvironment(): ValidatedEnvConfig {
+  const warnings: string[] = [];
   const loaded = loadProjectDotEnv();
 
+  // 1. Validate / resolve ATTENDANCE_DB_PATH with safe fallback to persistent default path
+  let dbPath: string;
+  let dbFromEnv = false;
+  const rawDbEnv = process.env.ATTENDANCE_DB_PATH?.trim();
+
+  if (rawDbEnv && isPlatformPlaceholderFlag(rawDbEnv)) {
+    const msg = `[Config] ATTENDANCE_DB_PATH contenía un marcador inválido ("${rawDbEnv}"); se utilizará la ruta persistente "${DEFAULT_RELATIVE_DB_PATH}".`;
+    console.warn(msg);
+    warnings.push(msg);
+    delete process.env.ATTENDANCE_DB_PATH;
+    dbPath = resolveAndValidateDbPath();
+  } else {
+    try {
+      dbPath = resolveAndValidateDbPath();
+      dbFromEnv = Boolean(rawDbEnv);
+    } catch (err) {
+      if (rawDbEnv) {
+        const detail = err instanceof Error ? err.message : String(err);
+        const msg = `[Config] ATTENDANCE_DB_PATH inválido (${detail}). Se utilizará la ruta persistente por defecto "${DEFAULT_RELATIVE_DB_PATH}".`;
+        console.warn(msg);
+        warnings.push(msg);
+        delete process.env.ATTENDANCE_DB_PATH;
+        dbPath = resolveAndValidateDbPath();
+        dbFromEnv = false;
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  // 2. Validate SESSION_SECRET (fail-closed: reject weak/invalid values and use CSPRNG fallback)
+  let sessionSecretMode: 'env' | 'ephemeral' = 'ephemeral';
   if (isPlatformPlaceholderFlag(process.env.SESSION_SECRET)) {
-    console.warn(
-      '[Config] SESSION_SECRET en el entorno contenía un marcador no válido; se rechaza y se utilizará una clave aleatoria efímera CSPRNG en memoria (configure un secreto real >= 32 caracteres para persistir sesiones).'
-    );
+    const msg =
+      '[Config] SESSION_SECRET en el entorno contenía un marcador no válido; se rechaza y se utilizará una clave aleatoria efímera CSPRNG en memoria (configure un secreto real >= 32 caracteres para persistir sesiones).';
+    console.warn(msg);
+    warnings.push(msg);
     delete process.env.SESSION_SECRET;
+  } else {
+    try {
+      const sessionCheck = validateSessionSecretIfConfigured();
+      sessionSecretMode = sessionCheck.configured ? 'env' : 'ephemeral';
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      const msg = `[Config] ${detail} Se descarta el valor inválido y se utilizará una clave aleatoria efímera CSPRNG en memoria.`;
+      console.warn(msg);
+      warnings.push(msg);
+      delete process.env.SESSION_SECRET;
+      sessionSecretMode = 'ephemeral';
+    }
   }
 
+  // 3. Validate ATTENDANCE_ADMIN_PASSCODE (fail-closed: reject weak/invalid values; rely on initial-setup hash)
+  let adminPasscodeConfigured = false;
   if (isPlatformPlaceholderFlag(process.env.ATTENDANCE_ADMIN_PASSCODE)) {
-    console.warn(
-      '[Config] ATTENDANCE_ADMIN_PASSCODE en el entorno contenía un marcador no válido; se rechaza y se deshabilita el código administrativo hasta configurar un valor seguro (>= 8 caracteres).'
-    );
+    const msg =
+      '[Config] ATTENDANCE_ADMIN_PASSCODE en el entorno contenía un marcador no válido; se rechaza y se deshabilita el código administrativo de entorno hasta configurar un valor seguro (>= 8 caracteres).';
+    console.warn(msg);
+    warnings.push(msg);
     delete process.env.ATTENDANCE_ADMIN_PASSCODE;
+  } else {
+    try {
+      const adminCheck = validateAdminPasscodeIfConfigured();
+      adminPasscodeConfigured = adminCheck.configured;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      const msg = `[Config] ${detail} Se descarta el valor inválido del entorno; el sistema continuará con la autenticación administrativa segura almacenada en el servidor.`;
+      console.warn(msg);
+      warnings.push(msg);
+      delete process.env.ATTENDANCE_ADMIN_PASSCODE;
+      adminPasscodeConfigured = false;
+    }
   }
-
-  const dbPath = resolveAndValidateDbPath();
-  const sessionCheck = validateSessionSecretIfConfigured();
-  const adminCheck = validateAdminPasscodeIfConfigured();
 
   return {
     dbPath,
-    dbFromEnv: Boolean(
-      process.env.ATTENDANCE_DB_PATH?.trim() &&
-        !isPlatformPlaceholderFlag(process.env.ATTENDANCE_DB_PATH)
-    ),
-    sessionSecretMode: sessionCheck.configured ? 'env' : 'ephemeral',
-    adminPasscodeConfigured: adminCheck.configured,
+    dbFromEnv,
+    sessionSecretMode,
+    adminPasscodeConfigured,
     envFileLoaded: loaded || dotEnvLoaded,
+    warnings,
   };
 }
