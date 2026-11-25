@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Escuela Secundaria de Los Bulacios</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      /* Screen base utilities */
+      .print-only {
+        display: none !important;
+      }
+
+      /* ==========================================================================
+         DEDICATED PRINT STYLESHEET (Escuela Secundaria de Los Bulacios)
+         ========================================================================== */
+      @media print {
+        @page {
+          size: A4 portrait;
+          margin: 10mm 12mm 12mm 12mm;
+        }
+
+        /* 1. Global Reset for Paper Presentation */
+        html, body {
+          background-color: #ffffff !important;
+          background: #ffffff !important;
+          color: #0f172a !important;
+          font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+          font-size: 10pt !important;
+          line-height: 1.35 !important;
+          width: 100% !important;
+          height: auto !important;
+          min-height: 0 !important;
+          overflow: visible !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+        }
+
+        /* 2. Hide Screen-Only and Interactive Elements */
+        .no-print,
+        header,
+        aside,
+        nav,
+        button,
+        input,
+        select,
+        textarea,
+        .student-screen-view {
+          display: none !important;
+        }
+
+        /* 3. Show Dedicated Print Layout */
+        .print-only {
+          display: block !important;
+        }
+
+        /* 4. Layout Container Normalization */
+        #root,
+        .min-h-screen,
+        main,
+        div {
+          overflow: visible !important;
+          height: auto !important;
+          min-height: 0 !important;
+          box-shadow: none !important;
+          border-radius: 0 !important;
+          filter: none !important;
+          transform: none !important;
+        }
+
+        main,
+        main > div {
+          max-width: 100% !important;
+          width: 100% !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          border: none !important;
+          background: transparent !important;
+        }
+
+        /* 5. Dedicated Print Sheet Styles */
+        .student-print-sheet {
+          display: block !important;
+          width: 100% !important;
+          max-width: 100% !important;
+          margin: 0 auto !important;
+          padding: 0 !important;
+          background: #ffffff !important;
+          color: #0f172a !important;
+        }
+
+        .student-print-sheet img {
+          max-width: 100% !important;
+          object-fit: cover !important;
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+        }
+
+        /* 6. Page Break Controls */
+        .print-avoid-break,
+        .print-section,
+        .print-table tr,
+        .print-signature-box {
+          page-break-inside: avoid !important;
+          break-inside: avoid !important;
+        }
+
+        /* 7. High-Contrast Paper Tables */
+        .print-table {
+          width: 100% !important;
+          border-collapse: collapse !important;
+          border-spacing: 0 !important;
+          margin-top: 4px !important;
+          margin-bottom: 6px !important;
+        }
+
+        .print-table th,
+        .print-table td {
+          border: 1px solid #475569 !important;
+          padding: 3.5px 6px !important;
+          font-size: 8.5pt !important;
+          color: #0f172a !important;
+        }
+
+        .print-table th {
+          background-color: #e2e8f0 !important;
+          font-weight: 700 !important;
+          text-transform: uppercase !important;
+          letter-spacing: 0.04em !important;
+          text-align: center !important;
+        }
+
+        /* 8. Text Formatting and Contrast */
+        .print-badge {
+          border: 1px solid #475569 !important;
+          padding: 1px 6px !important;
+          font-size: 8pt !important;
+          font-weight: bold !important;
+          border-radius: 3px !important;
+          display: inline-block !important;
+        }
+
+        /* Clean borders on paper */
+        .print-border {
+          border: 1px solid #94a3b8 !important;
+        }
+
+        .print-border-b {
+          border-bottom: 1px solid #94a3b8 !important;
+        }
+
+        /* Remove link decorations in paper output */
+        a {
+          text-decoration: none !important;
+          color: inherit !important;
+        }
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react": "https://aistudiocdn.com/react@^19.2.1",
+    "react/": "https://aistudiocdn.com/react@^19.2.1/",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.1/",
+    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.556.0",
+    "recharts": "https://aistudiocdn.com/recharts@^3.5.1",
+    "xlsx": "https://aistudiocdn.com/xlsx@^0.18.5"
+  }
+}
+</script>
+</head>
+  <body class="bg-gray-50">
+    <div id="root"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
